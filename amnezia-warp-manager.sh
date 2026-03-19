@@ -358,12 +358,12 @@ parse_clients_table() {
     /^\[Peer\]/ { pubkey=""; ip="" }
     /^PublicKey/ {
       s = $0
-      gsub(/.*= */, "", s)
+      sub(/^[^=]*= */, "", s)
       pubkey = s
     }
     /^AllowedIPs/ {
       s = $0
-      gsub(/.*= */, "", s)
+      sub(/^[^=]*= */, "", s)
       ip = s
       if (pubkey != "" && ip != "") {
         print pubkey "|" ip
