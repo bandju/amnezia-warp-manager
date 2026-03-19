@@ -22,6 +22,7 @@ SUBNET=""
 WARP_ENDPOINT_IP=""
 WARP_EXIT_IP=""
 SELECTED_IPS=()
+CLIENT_IPS=()
 
 MARKER_BEGIN="# --- WARP-MANAGER BEGIN ---"
 MARKER_END="# --- WARP-MANAGER END ---"
@@ -43,7 +44,7 @@ cls() { printf '\033[2J\033[H'; }
 
 pause_prompt() {
   echo
-  read -rp "Нажми Enter чтобы вернуться в меню..." _
+  read -rp "Нажми Enter чтобы вернуться в меню..." _ || true
 }
 
 require_root() {
@@ -105,7 +106,6 @@ pick_container() {
     return
   fi
 
-  cls
   echo
   echo -e "${C_BOLD}Доступные контейнеры:${C_RESET}"
   local i=1
@@ -163,7 +163,9 @@ load_container_data() {
 detect_warp_exit_ip() {
   WARP_EXIT_IP=""
   if docker exec "$CONTAINER" sh -c "ip addr show warp >/dev/null 2>&1"; then
-    WARP_EXIT_IP="$(docker exec "$CONTAINER" sh -c "curl -s --interface warp --connect-timeout 3 https://ifconfig.me 2>/dev/null || wget -qO- --bind-address=\$(ip -4 addr show warp | awk '/inet /{print \$2}' | cut -d/ -f1) --timeout=3 https://ifconfig.me 2>/dev/null" | tr -d '\r\n' || true)"
+    WARP_EXIT_IP="$(docker exec "$CONTAINER" sh -c \
+      "curl -s --interface warp --connect-timeout 3 https://ifconfig.me 2>/dev/null || true" \
+      | tr -d '\r\n')" || true
   fi
 }
 
@@ -292,7 +294,9 @@ load_warp_clients() {
   if [ -n "$raw" ]; then
     while IFS= read -r line; do
       line="$(echo "$line" | xargs)"
-      [ -n "$line" ] && SELECTED_IPS+=("$line")
+      if [ -n "$line" ]; then
+        SELECTED_IPS+=("$line")
+      fi
     done <<< "$raw"
   fi
 }
@@ -315,42 +319,47 @@ parse_clients_table() {
   CLIENT_NAMES=()
   local raw
   raw="$(docker exec "$CONTAINER" sh -c "cat '$CLIENTS_TABLE' 2>/dev/null || true" | tr -d '\r')"
-  [ -z "$raw" ] && return
+  [ -z "$raw" ] && return 0
 
-  # Extract name=ip pairs using awk; handles both pretty and compact JSON
-  local pairs
-  pairs="$(echo "$raw" | awk '
-    BEGIN { name=""; ip="" }
-    /"clientName"/ {
-      gsub(/.*"clientName"[[:space:]]*:[[:space:]]*"/, "");
-      gsub(/".*/, "");
-      name = $0;
-    }
-    /"clientIP"/ {
-      gsub(/.*"clientIP"[[:space:]]*:[[:space:]]*"/, "");
-      gsub(/".*/, "");
-      ip = $0;
-      if (name != "" && ip != "") {
-        print ip "=" name;
-      }
-      name = ""; ip = "";
-    }
-  ')"
+  # Extract clientName values in document order
+  local names_arr=()
+  mapfile -t names_arr < <(echo "$raw" | grep -o '"clientName"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"clientName"[[:space:]]*:[[:space:]]*"//;s/"$//')
 
-  while IFS='=' read -r ip name; do
-    [ -n "$ip" ] && [ -n "$name" ] && CLIENT_NAMES["$ip"]="$name"
-  done <<< "$pairs"
+  # Extract clientIP values in document order
+  local ips_arr=()
+  mapfile -t ips_arr < <(echo "$raw" | grep -o '"clientIP"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"clientIP"[[:space:]]*:[[:space:]]*"//;s/"$//')
+
+  # Pair them up
+  local count="${#names_arr[@]}"
+  if [ "${#ips_arr[@]}" -lt "$count" ]; then
+    count="${#ips_arr[@]}"
+  fi
+
+  local idx=0
+  while [ "$idx" -lt "$count" ]; do
+    local ip="${ips_arr[$idx]}"
+    local name="${names_arr[$idx]}"
+    if [ -n "$ip" ] && [ -n "$name" ]; then
+      CLIENT_NAMES["$ip"]="$name"
+      # Also store with /32 suffix for lookup
+      CLIENT_NAMES["${ip}/32"]="$name"
+    fi
+    idx=$((idx+1))
+  done
+
+  return 0
 }
 
 get_client_name() {
   local ip_raw="$1"
-  local ip="${ip_raw%/32}"
-  if [ -n "${CLIENT_NAMES[$ip]+x}" ]; then
-    echo "${CLIENT_NAMES[$ip]}"
-  elif [ -n "${CLIENT_NAMES[${ip}/32]+x}" ]; then
-    echo "${CLIENT_NAMES[${ip}/32]}"
-  else
-    echo ""
+  local ip_bare="${ip_raw%/32}"
+
+  if [ -n "${CLIENT_NAMES[${ip_bare}]+_}" ]; then
+    echo "${CLIENT_NAMES[${ip_bare}]}"
+  elif [ -n "${CLIENT_NAMES[${ip_bare}/32]+_}" ]; then
+    echo "${CLIENT_NAMES[${ip_bare}/32]}"
+  elif [ -n "${CLIENT_NAMES[${ip_raw}]+_}" ]; then
+    echo "${CLIENT_NAMES[${ip_raw}]}"
   fi
 }
 
@@ -368,17 +377,19 @@ format_client_label() {
 # --- Client IP list from VPN config ---
 
 get_client_ips_from_conf() {
+  CLIENT_IPS=()
   mapfile -t CLIENT_IPS < <(docker exec "$CONTAINER" sh -c "sed -n 's/^AllowedIPs = \\(.*\\/32\\)$/\\1/p' '$VPN_CONF'" | tr -d '\r')
   if [ "${#CLIENT_IPS[@]}" -eq 0 ]; then
     err "Не удалось получить список IP клиентов"
-    exit 1
+    return 1
   fi
+  return 0
 }
 
 # --- Interactive client selection ---
 
 choose_ips_to_add() {
-  get_client_ips_from_conf
+  get_client_ips_from_conf || return 1
   parse_clients_table
 
   load_warp_clients
@@ -404,7 +415,10 @@ choose_ips_to_add() {
   echo
 
   read -rp "Введи номер, несколько через запятую, или all: " answer
-  [ -z "$answer" ] || [ "$answer" = "0" ] && return 1
+
+  if [ -z "$answer" ] || [ "$answer" = "0" ]; then
+    return 1
+  fi
 
   local new_ips=()
 
@@ -426,7 +440,10 @@ choose_ips_to_add() {
   for nip in "${new_ips[@]}"; do
     local found=0
     for eip in "${SELECTED_IPS[@]}"; do
-      [ "$nip" = "$eip" ] && found=1 && break
+      if [ "$nip" = "$eip" ]; then
+        found=1
+        break
+      fi
     done
     if [ "$found" -eq 0 ]; then
       SELECTED_IPS+=("$nip")
@@ -464,7 +481,10 @@ choose_ips_to_remove() {
   echo
 
   read -rp "Введи номер, несколько через запятую, или all: " answer
-  [ -z "$answer" ] || [ "$answer" = "0" ] && return 1
+
+  if [ -z "$answer" ] || [ "$answer" = "0" ]; then
+    return 1
+  fi
 
   local remove_ips=()
 
@@ -487,7 +507,10 @@ choose_ips_to_remove() {
   for eip in "${SELECTED_IPS[@]}"; do
     local removing=0
     for rip in "${remove_ips[@]}"; do
-      [ "$eip" = "$rip" ] && removing=1 && break
+      if [ "$eip" = "$rip" ]; then
+        removing=1
+        break
+      fi
     done
     if [ "$removing" -eq 0 ]; then
       new_list+=("$eip")
@@ -523,7 +546,7 @@ apply_runtime_rules() {
 
   if [ "${#SELECTED_IPS[@]}" -eq 0 ]; then
     log "Нет клиентов для WARP — правила не применяются"
-    return
+    return 0
   fi
 
   docker exec "$CONTAINER" sh -c "ip route add default dev warp table 100 2>/dev/null || ip route replace default dev warp table 100"
@@ -619,6 +642,7 @@ ensure_warp_installed() {
 
   if [ "$warp_exists" -eq 0 ]; then
     log "WARP не установлен — запускаю установку..."
+    echo
     backup_container_files
     install_wgcf_host
     ensure_wgcf_account
@@ -627,17 +651,19 @@ ensure_warp_installed() {
     copy_profile_into_container
     build_warp_conf_in_container
     ensure_warp_up_now
+    echo
+    ok "WARP установлен и готов к работе!"
+    echo
   else
-    ok "WARP уже установлен в контейнере"
-    docker exec "$CONTAINER" sh -c "ip addr show warp >/dev/null 2>&1" || {
+    ok "WARP установлен"
+    if ! docker exec "$CONTAINER" sh -c "ip addr show warp >/dev/null 2>&1"; then
       log "Поднимаю интерфейс warp..."
       ensure_warp_up_now
-    }
+    fi
   fi
 }
 
 action_add_clients() {
-  ensure_warp_installed
   if choose_ips_to_add; then
     apply_runtime_rules
     patch_start_sh
@@ -680,6 +706,7 @@ action_show_status() {
   cls
   echo
   echo -e "${C_BOLD}===== STATUS: $CONTAINER =====${C_RESET}"
+  echo
   docker exec "$CONTAINER" sh -c '
 echo "-- warp iface --"
 ip addr show warp 2>/dev/null || echo "warp отсутствует"
@@ -713,8 +740,11 @@ full_uninstall_warp() {
   cls
   echo
   read -rp "Точно удалить WARP полностью? [y/N]: " confirm
-  [[ "${confirm,,}" != "y" ]] && return
+  if [[ "${confirm,,}" != "y" ]]; then
+    return 0
+  fi
 
+  echo
   log "Полное удаление WARP из контейнера $CONTAINER..."
 
   cleanup_runtime_rules
@@ -740,7 +770,7 @@ full_uninstall_warp() {
 
   docker restart "$CONTAINER" >/dev/null
   sleep 2
-  ok "WARP полностью удалён из контейнера $CONTAINER"
+  ok "WARP удалён из контейнера $CONTAINER"
 
   # Clean up host files
   rm -f "$WGCF_BIN" "$WGCF_ACCOUNT" "$WGCF_PROFILE"
@@ -762,13 +792,13 @@ restart_container() {
   while [ "$attempts" -lt 10 ]; do
     if docker exec "$CONTAINER" sh -c "true" 2>/dev/null; then
       ok "Контейнер перезапущен"
-      return
+      return 0
     fi
     sleep 1
     attempts=$((attempts+1))
   done
   err "Контейнер не поднялся за 10 секунд"
-  exit 1
+  return 1
 }
 
 # --- Menu ---
@@ -798,21 +828,20 @@ print_menu() {
 }
 
 menu() {
-  detect_warp_exit_ip
-
   while true; do
+    detect_warp_exit_ip
     print_menu
     read -rp "Выбери пункт: " action
 
     case "$action" in
-      1) action_add_clients; detect_warp_exit_ip ;;
+      1) action_add_clients ;;
       2) action_remove_clients ;;
       3) action_show_warp_clients ;;
       4) action_show_status ;;
-      5) restart_container; pause_prompt; detect_warp_exit_ip ;;
+      5) restart_container || true; pause_prompt ;;
       6) full_uninstall_warp; WARP_EXIT_IP="" ;;
       0) cls; ok "Выход. Чтобы вернуться — набери: mywarp"; echo; exit 0 ;;
-      *) err "Неверный пункт"; sleep 1 ;;
+      *) ;;
     esac
   done
 }
@@ -822,6 +851,7 @@ main() {
   pick_container
   load_container_data
   ensure_mywarp
+  ensure_warp_installed
   menu
 }
 
