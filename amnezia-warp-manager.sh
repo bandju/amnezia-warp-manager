@@ -317,43 +317,69 @@ declare -gA CLIENT_NAMES=()
 
 parse_clients_table() {
   CLIENT_NAMES=()
+
+  # Step 1: clientsTable JSON → clientId|clientName map
   local raw
   raw="$(docker exec "$CONTAINER" sh -c "cat '$CLIENTS_TABLE' 2>/dev/null || true" | tr -d '\r')"
   [ -z "$raw" ] && return 0
 
-  # clientsTable is JSON array with nested userData:
-  # { "clientId": "...", "userData": { "allowedIps": "10.8.1.2/32", "clientName": "foo", ... } }
-  # Not all entries have allowedIps. Parse name+ip per userData block.
-  local pairs
-  pairs="$(echo "$raw" | awk '
-    /"userData"/ { name=""; ip="" }
+  # Extract clientId and clientName pairs from JSON
+  declare -A KEY_TO_NAME=()
+  local id_name_pairs
+  id_name_pairs="$(echo "$raw" | awk '
+    /"clientId"/ {
+      s = $0
+      gsub(/.*"clientId"[[:space:]]*:[[:space:]]*"/, "", s)
+      gsub(/".*/, "", s)
+      cid = s
+    }
     /"clientName"/ {
       s = $0
       gsub(/.*"clientName"[[:space:]]*:[[:space:]]*"/, "", s)
       gsub(/".*/, "", s)
       name = s
-    }
-    /"allowedIps"/ {
-      s = $0
-      gsub(/.*"allowedIps"[[:space:]]*:[[:space:]]*"/, "", s)
-      gsub(/".*/, "", s)
-      ip = s
-    }
-    /\}/ {
-      if (name != "" && ip != "") {
-        print ip "|" name
+      if (cid != "" && name != "") {
+        print cid "|" name
       }
     }
   ')"
 
-  if [ -n "$pairs" ]; then
-    while IFS='|' read -r ip name; do
-      if [ -n "$ip" ] && [ -n "$name" ]; then
+  if [ -n "$id_name_pairs" ]; then
+    while IFS='|' read -r cid name; do
+      if [ -n "$cid" ] && [ -n "$name" ]; then
+        KEY_TO_NAME["$cid"]="$name"
+      fi
+    done <<< "$id_name_pairs"
+  fi
+
+  # Step 2: VPN conf → PublicKey|AllowedIPs map, then join with clientId
+  local conf_peers
+  conf_peers="$(docker exec "$CONTAINER" sh -c "cat '$VPN_CONF' 2>/dev/null || true" | tr -d '\r' | awk '
+    /^\[Peer\]/ { pubkey=""; ip="" }
+    /^PublicKey/ {
+      s = $0
+      gsub(/.*= */, "", s)
+      pubkey = s
+    }
+    /^AllowedIPs/ {
+      s = $0
+      gsub(/.*= */, "", s)
+      ip = s
+      if (pubkey != "" && ip != "") {
+        print pubkey "|" ip
+      }
+    }
+  ')"
+
+  if [ -n "$conf_peers" ]; then
+    while IFS='|' read -r pubkey ip; do
+      if [ -n "$pubkey" ] && [ -n "$ip" ] && [ -n "${KEY_TO_NAME[$pubkey]+_}" ]; then
+        local name="${KEY_TO_NAME[$pubkey]}"
         CLIENT_NAMES["$ip"]="$name"
         local bare="${ip%/32}"
         CLIENT_NAMES["$bare"]="$name"
       fi
-    done <<< "$pairs"
+    done <<< "$conf_peers"
   fi
 
   return 0
