@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="amnezia-warp-manager"
-SCRIPT_URL="https://raw.githubusercontent.com/bandju/amnezia-warp-manager/refs/heads/main/amnezia-warp-manager.sh"
+SCRIPT_URL="https://github.com/bandju/amnezia-warp-manager/releases/latest/download/amnezia-warp-manager.sh"
 WGCF_VERSION="2.2.30"
 WGCF_BIN="/root/wgcf"
 WGCF_ACCOUNT="/root/wgcf-account.toml"
