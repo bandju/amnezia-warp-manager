@@ -8,7 +8,7 @@ Bash-скрипт для управления Cloudflare WARP внутри Docke
 ## Установка и запуск
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/bandju/amnezia-warp-manager/refs/heads/main/amnezia-warp-manager.sh)
+bash <(curl -sL https://github.com/bandju/amnezia-warp-manager/releases/latest/download/amnezia-warp-manager.sh)
 ```
 
 При первом запуске скрипт автоматически:
