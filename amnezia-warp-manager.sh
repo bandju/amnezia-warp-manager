@@ -321,31 +321,40 @@ parse_clients_table() {
   raw="$(docker exec "$CONTAINER" sh -c "cat '$CLIENTS_TABLE' 2>/dev/null || true" | tr -d '\r')"
   [ -z "$raw" ] && return 0
 
-  # Extract clientName values in document order
-  local names_arr=()
-  mapfile -t names_arr < <(echo "$raw" | grep -o '"clientName"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"clientName"[[:space:]]*:[[:space:]]*"//;s/"$//')
+  # clientsTable is JSON array with nested userData:
+  # { "clientId": "...", "userData": { "allowedIps": "10.8.1.2/32", "clientName": "foo", ... } }
+  # Not all entries have allowedIps. Parse name+ip per userData block.
+  local pairs
+  pairs="$(echo "$raw" | awk '
+    /"userData"/ { name=""; ip="" }
+    /"clientName"/ {
+      s = $0
+      gsub(/.*"clientName"[[:space:]]*:[[:space:]]*"/, "", s)
+      gsub(/".*/, "", s)
+      name = s
+    }
+    /"allowedIps"/ {
+      s = $0
+      gsub(/.*"allowedIps"[[:space:]]*:[[:space:]]*"/, "", s)
+      gsub(/".*/, "", s)
+      ip = s
+    }
+    /\}/ {
+      if (name != "" && ip != "") {
+        print ip "|" name
+      }
+    }
+  ')"
 
-  # Extract clientIP values in document order
-  local ips_arr=()
-  mapfile -t ips_arr < <(echo "$raw" | grep -o '"clientIP"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"clientIP"[[:space:]]*:[[:space:]]*"//;s/"$//')
-
-  # Pair them up
-  local count="${#names_arr[@]}"
-  if [ "${#ips_arr[@]}" -lt "$count" ]; then
-    count="${#ips_arr[@]}"
+  if [ -n "$pairs" ]; then
+    while IFS='|' read -r ip name; do
+      if [ -n "$ip" ] && [ -n "$name" ]; then
+        CLIENT_NAMES["$ip"]="$name"
+        local bare="${ip%/32}"
+        CLIENT_NAMES["$bare"]="$name"
+      fi
+    done <<< "$pairs"
   fi
-
-  local idx=0
-  while [ "$idx" -lt "$count" ]; do
-    local ip="${ips_arr[$idx]}"
-    local name="${names_arr[$idx]}"
-    if [ -n "$ip" ] && [ -n "$name" ]; then
-      CLIENT_NAMES["$ip"]="$name"
-      # Also store with /32 suffix for lookup
-      CLIENT_NAMES["${ip}/32"]="$name"
-    fi
-    idx=$((idx+1))
-  done
 
   return 0
 }
@@ -806,9 +815,9 @@ restart_container() {
 print_menu() {
   cls
   echo
-  echo -e "${C_BOLD}╔══════════════════════════════════════════╗${C_RESET}"
-  echo -e "${C_BOLD}║         amnezia-warp-manager             ║${C_RESET}"
-  echo -e "${C_BOLD}╚══════════════════════════════════════════╝${C_RESET}"
+  echo -e "${C_BOLD}╔══════════════════════════════════════════════════╗${C_RESET}"
+  echo -e "${C_BOLD}║       amnezia-warp-manager  ${C_DIM}by @bandju001${C_RESET}${C_BOLD}        ║${C_RESET}"
+  echo -e "${C_BOLD}╚══════════════════════════════════════════════════╝${C_RESET}"
   echo -e "  Контейнер: ${C_CYAN}${CONTAINER}${C_RESET}"
   echo -e "  Подсеть:   ${C_CYAN}${SUBNET}${C_RESET}"
   if [ -n "$WARP_EXIT_IP" ]; then
@@ -840,7 +849,7 @@ menu() {
       4) action_show_status ;;
       5) restart_container || true; pause_prompt ;;
       6) full_uninstall_warp; WARP_EXIT_IP="" ;;
-      0) cls; ok "Выход. Чтобы вернуться — набери: mywarp"; echo; exit 0 ;;
+      0) cls; ok "Выход. Чтобы вернуться — набери: mywarp"; echo -e "${C_DIM}github.com/bandju${C_RESET}"; echo; exit 0 ;;
       *) ;;
     esac
   done
